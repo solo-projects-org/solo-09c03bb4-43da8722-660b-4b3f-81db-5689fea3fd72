@@ -637,3 +637,358 @@ def test_openapi_and_docs_available(client: TestClient):
     assert client.get("/openapi.json").status_code == 200
     assert client.get("/docs").status_code == 200
     assert client.get("/healthz").json()["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Cross-version route diff
+# ---------------------------------------------------------------------------
+
+
+def make_feed(stops, trips, stop_times) -> bytes:
+    """stops: [stop_id]; trips: [(route_id, trip_id)];
+    stop_times: [(trip_id, stop_id, stop_sequence, arrival_time)]."""
+    stops_txt = "stop_id,stop_name\n" + "".join(f"{s},Name {s}\n" for s in stops)
+    trips_txt = "route_id,trip_id\n" + "".join(f"{r},{t}\n" for r, t in trips)
+    times_txt = "trip_id,arrival_time,stop_id,stop_sequence\n" + "".join(
+        f"{t},{tm},{s},{seq}\n" for t, s, seq, tm in stop_times
+    )
+    return zip_bytes(
+        {"stops.txt": stops_txt, "trips.txt": trips_txt, "stop_times.txt": times_txt}
+    )
+
+
+def test_route_diff_pairs_renumbered_trips_with_per_stop_diffs(client: TestClient):
+    v1 = make_feed(
+        stops=["S1", "S2", "S3"],
+        trips=[("R1", "T1"), ("R1", "T2"), ("R2", "X1")],
+        stop_times=[
+            ("T1", "S1", 1, "06:00:00"), ("T1", "S2", 2, "06:10:00"), ("T1", "S3", 3, "06:20:00"),
+            ("T2", "S1", 1, "07:00:00"), ("T2", "S2", 2, "07:10:00"), ("T2", "S3", 3, "07:20:00"),
+            ("X1", "S1", 1, "08:00:00"), ("X1", "S3", 2, "08:30:00"),
+        ],
+    )
+    # Trip ids are renumbered in v2; times shift by a few minutes.
+    v2 = make_feed(
+        stops=["S1", "S2", "S3"],
+        trips=[("R1", "N1"), ("R1", "N2"), ("R2", "X1")],
+        stop_times=[
+            ("N1", "S1", 1, "06:05:00"), ("N1", "S2", 2, "06:16:00"), ("N1", "S3", 3, "06:27:00"),
+            ("N2", "S1", 1, "07:08:00"), ("N2", "S2", 2, "07:19:00"), ("N2", "S3", 3, "07:30:00"),
+            ("X1", "S1", 1, "08:00:00"), ("X1", "S3", 2, "08:30:00"),
+        ],
+    )
+    assert upload(client, v1).status_code == 201
+    assert upload(client, v2).status_code == 201
+
+    response = client.get("/api/v1/routes/R1/diff?from=1&to=2&max_offset_minutes=10")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["route_id"] == "R1"
+    assert body["from_version"] == 1
+    assert body["to_version"] == 2
+    assert body["max_offset_minutes"] == 10
+    assert body["removed_trips"] == []
+    assert body["added_trips"] == []
+    # Only R1 trips appear; the R2 trip is untouched by this query.
+    pairs = body["matched_pairs"]
+    assert [(p["from_trip_id"], p["to_trip_id"]) for p in pairs] == [
+        ("T1", "N1"),
+        ("T2", "N2"),
+    ]
+    first = pairs[0]
+    assert first["first_stop_diff_seconds"] == 300
+    assert [s["stop_id"] for s in first["stops"]] == ["S1", "S2", "S3"]
+    assert [s["diff_seconds"] for s in first["stops"]] == [300, 360, 420]
+    assert first["stops"][0]["from_arrival_time"] == "06:00:00"
+    assert first["stops"][0]["to_arrival_time"] == "06:05:00"
+    assert first["stops"][0]["from_stop_sequence"] == 1
+    assert first["stops"][0]["to_stop_sequence"] == 1
+    second = pairs[1]
+    assert second["first_stop_diff_seconds"] == 480
+    assert [s["diff_seconds"] for s in second["stops"]] == [480, 540, 600]
+
+
+def test_route_diff_respects_offset_limit(client: TestClient):
+    v1 = make_feed(
+        stops=["S1", "S2"],
+        trips=[("R1", "T1")],
+        stop_times=[("T1", "S1", 1, "06:00:00"), ("T1", "S2", 2, "06:10:00")],
+    )
+    v2 = make_feed(
+        stops=["S1", "S2"],
+        trips=[("R1", "N1")],
+        stop_times=[("N1", "S1", 1, "06:20:00"), ("N1", "S2", 2, "06:30:00")],
+    )
+    assert upload(client, v1).status_code == 201
+    assert upload(client, v2).status_code == 201
+
+    too_tight = client.get("/api/v1/routes/R1/diff?from=1&to=2&max_offset_minutes=10")
+    assert too_tight.status_code == 200
+    body = too_tight.json()
+    assert body["matched_pairs"] == []
+    assert body["removed_trips"] == ["T1"]
+    assert body["added_trips"] == ["N1"]
+
+    wide = client.get("/api/v1/routes/R1/diff?from=1&to=2&max_offset_minutes=20")
+    assert wide.status_code == 200
+    assert [(p["from_trip_id"], p["to_trip_id"]) for p in wide.json()["matched_pairs"]] == [
+        ("T1", "N1")
+    ]
+
+
+def test_route_diff_maximises_pairs_then_minimises_total_diff(client: TestClient):
+    """The lexicographic objective: pair count first, total offset second."""
+    v1 = make_feed(
+        stops=["S1", "S2"],
+        trips=[("R1", "A1"), ("R1", "A2"), ("R2", "C1"), ("R2", "C2")],
+        stop_times=[
+            ("A1", "S1", 1, "06:00:00"),
+            ("A2", "S1", 1, "06:01:40"),
+            ("C1", "S2", 1, "06:00:00"),
+            ("C2", "S2", 1, "06:01:40"),
+        ],
+    )
+    v2 = make_feed(
+        stops=["S1", "S2"],
+        trips=[("R1", "B1"), ("R1", "B2"), ("R2", "D1"), ("R2", "D2")],
+        stop_times=[
+            ("B1", "S1", 1, "06:01:30"),
+            ("B2", "S1", 1, "06:03:10"),
+            ("D1", "S2", 1, "06:01:35"),
+            ("D2", "S2", 1, "06:01:45"),
+        ],
+    )
+    assert upload(client, v1).status_code == 201
+    assert upload(client, v2).status_code == 201
+
+    # R1, offset 120s: edges A1-B1 (90s), A2-B1 (10s), A2-B2 (90s).
+    # The cheapest single pair would be A2-B1 (10s), but two pairs win.
+    body = client.get("/api/v1/routes/R1/diff?from=1&to=2&max_offset_minutes=2").json()
+    assert [(p["from_trip_id"], p["to_trip_id"]) for p in body["matched_pairs"]] == [
+        ("A1", "B1"),
+        ("A2", "B2"),
+    ]
+    assert [p["first_stop_diff_seconds"] for p in body["matched_pairs"]] == [90, 90]
+
+    # R2, offset 120s: both size-2 matchings feasible; the non-crossed one
+    # costs 95+5=100s against 105+5=110s crossed, so it must be chosen.
+    body = client.get("/api/v1/routes/R2/diff?from=1&to=2&max_offset_minutes=2").json()
+    assert [(p["from_trip_id"], p["to_trip_id"]) for p in body["matched_pairs"]] == [
+        ("C1", "D1"),
+        ("C2", "D2"),
+    ]
+    assert [p["first_stop_diff_seconds"] for p in body["matched_pairs"]] == [95, 5]
+
+
+def test_route_diff_requires_identical_stop_sequence(client: TestClient):
+    v1 = make_feed(
+        stops=["S1", "S2", "S3"],
+        trips=[("R1", "T1"), ("R1", "T2")],
+        stop_times=[
+            ("T1", "S1", 1, "06:00:00"), ("T1", "S2", 2, "06:10:00"), ("T1", "S3", 3, "06:20:00"),
+            ("T2", "S1", 1, "06:00:00"), ("T2", "S3", 2, "06:15:00"),   # express pattern
+        ],
+    )
+    v2 = make_feed(
+        stops=["S1", "S2", "S3"],
+        trips=[("R1", "N1"), ("R1", "N2")],
+        stop_times=[
+            ("N1", "S1", 1, "06:01:00"), ("N1", "S2", 2, "06:11:00"), ("N1", "S3", 3, "06:21:00"),
+            ("N2", "S1", 1, "06:00:00"), ("N2", "S2", 2, "06:12:00"),   # new pattern
+        ],
+    )
+    assert upload(client, v1).status_code == 201
+    assert upload(client, v2).status_code == 201
+
+    body = client.get("/api/v1/routes/R1/diff?from=1&to=2&max_offset_minutes=30").json()
+    # Same departure time alone is not enough: T2/N2 have different stop
+    # sequences, so they cannot pair despite identical first-stop times.
+    assert [(p["from_trip_id"], p["to_trip_id"]) for p in body["matched_pairs"]] == [
+        ("T1", "N1")
+    ]
+    assert body["removed_trips"] == ["T2"]
+    assert body["added_trips"] == ["N2"]
+
+
+def test_route_diff_one_to_one_matching(client: TestClient):
+    v1 = make_feed(
+        stops=["S1", "S2"],
+        trips=[("R1", "T1"), ("R1", "T2")],
+        stop_times=[
+            ("T1", "S1", 1, "06:00:00"), ("T1", "S2", 2, "06:10:00"),
+            ("T2", "S1", 1, "06:01:00"), ("T2", "S2", 2, "06:11:00"),
+        ],
+    )
+    v2 = make_feed(
+        stops=["S1", "S2"],
+        trips=[("R1", "N1")],
+        stop_times=[("N1", "S1", 1, "06:00:30"), ("N1", "S2", 2, "06:10:30")],
+    )
+    assert upload(client, v1).status_code == 201
+    assert upload(client, v2).status_code == 201
+
+    body = client.get("/api/v1/routes/R1/diff?from=1&to=2&max_offset_minutes=5").json()
+    # One new trip can absorb only one old trip; the other is reported removed.
+    assert len(body["matched_pairs"]) == 1
+    pair = body["matched_pairs"][0]
+    assert pair["to_trip_id"] == "N1"
+    assert pair["from_trip_id"] == "T1"  # deterministic: earliest, then trip_id
+    assert body["removed_trips"] == ["T2"]
+    assert body["added_trips"] == []
+
+
+def test_route_diff_past_midnight_times_compare_as_service_day_seconds(client: TestClient):
+    v1 = make_feed(
+        stops=["S1", "S2"],
+        trips=[("R1", "T1")],
+        stop_times=[("T1", "S1", 1, "23:50:00"), ("T1", "S2", 2, "24:05:00")],
+    )
+    v2 = make_feed(
+        stops=["S1", "S2"],
+        trips=[("R1", "N1")],
+        stop_times=[("N1", "S1", 1, "24:10:00"), ("N1", "S2", 2, "24:25:00")],
+    )
+    assert upload(client, v1).status_code == 201
+    assert upload(client, v2).status_code == 201
+
+    body = client.get("/api/v1/routes/R1/diff?from=1&to=2&max_offset_minutes=30").json()
+    assert len(body["matched_pairs"]) == 1
+    pair = body["matched_pairs"][0]
+    # 24:10:00 is 1200s after 23:50:00 on the service day, not -85800s.
+    assert pair["first_stop_diff_seconds"] == 1200
+    assert [s["diff_seconds"] for s in pair["stops"]] == [1200, 1200]
+    assert pair["stops"][0]["to_arrival_time"] == "24:10:00"
+    assert pair["stops"][0]["to_arrival_seconds"] == 24 * 3600 + 10 * 60
+
+
+def test_route_diff_current_alias_and_self_compare(client: TestClient):
+    assert upload(client).status_code == 201
+
+    body = client.get("/api/v1/routes/R1/diff?from=current&to=current").json()
+    assert body["from_version"] == 1
+    assert body["to_version"] == 1
+    assert body["removed_trips"] == []
+    assert body["added_trips"] == []
+    assert [(p["from_trip_id"], p["to_trip_id"]) for p in body["matched_pairs"]] == [
+        ("T1", "T1"),
+        ("T2", "T2"),
+    ]
+    for pair in body["matched_pairs"]:
+        assert pair["first_stop_diff_seconds"] == 0
+        assert all(s["diff_seconds"] == 0 for s in pair["stops"])
+
+    # `to` defaults to current when omitted.
+    body = client.get("/api/v1/routes/R1/diff?from=1").json()
+    assert body["from_version"] == 1
+    assert body["to_version"] == 1
+
+
+def test_route_diff_route_present_in_only_one_version(client: TestClient):
+    v1 = make_feed(
+        stops=["S1", "S2"],
+        trips=[("R1", "T1")],
+        stop_times=[("T1", "S1", 1, "06:00:00"), ("T1", "S2", 2, "06:10:00")],
+    )
+    v2 = make_feed(
+        stops=["S1", "S2"],
+        trips=[("R2", "U1")],
+        stop_times=[("U1", "S1", 1, "07:00:00"), ("U1", "S2", 2, "07:10:00")],
+    )
+    assert upload(client, v1).status_code == 201
+    assert upload(client, v2).status_code == 201
+
+    # R1 disappeared in v2: every trip is reported removed, none added.
+    body = client.get("/api/v1/routes/R1/diff?from=1&to=2&max_offset_minutes=0").json()
+    assert body["matched_pairs"] == []
+    assert body["removed_trips"] == ["T1"]
+    assert body["added_trips"] == []
+
+    # And in the opposite direction it looks like a brand-new route.
+    body = client.get("/api/v1/routes/R2/diff?from=1&to=2&max_offset_minutes=0").json()
+    assert body["matched_pairs"] == []
+    assert body["removed_trips"] == []
+    assert body["added_trips"] == ["U1"]
+
+
+def test_route_diff_errors(client: TestClient):
+    assert upload(client).status_code == 201
+
+    response = client.get("/api/v1/routes/NOPE/diff?from=1&to=1")
+    assert response.status_code == 404
+    assert response.json()["error"] == "route_not_found"
+
+    response = client.get("/api/v1/routes/R1/diff?from=99&to=1")
+    assert response.status_code == 404
+    assert response.json()["error"] == "version_not_found"
+
+    response = client.get("/api/v1/routes/R1/diff?from=abc&to=1")
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_version"
+
+    response = client.get("/api/v1/routes/R1/diff?from=1&to=1&max_offset_minutes=-1")
+    assert response.status_code == 422
+
+    response = client.get("/api/v1/routes/R1/diff")
+    assert response.status_code == 422  # `from` is required
+
+
+def test_route_diff_no_versions_yet(client: TestClient):
+    response = client.get("/api/v1/routes/R1/diff?from=current&to=current")
+    assert response.status_code == 404
+    assert response.json()["error"] == "no_published_version"
+
+
+def test_route_diff_resolves_current_once_per_request(client: TestClient):
+    """from=current&to=current must resolve to one version even while a
+    publication commits concurrently — both reads share one snapshot."""
+    def feed_files(marker: str) -> dict[str, str]:
+        stops = ["stop_id,stop_name"] + [f"S{i},{marker}-{i}" for i in range(50)]
+        trips = ["route_id,trip_id"] + [f"R1,T{i}" for i in range(10)]
+        times = ["trip_id,arrival_time,stop_id,stop_sequence"]
+        for trip in range(10):
+            for seq in range(50):
+                times.append(f"T{trip},{6 + seq // 60:02d}:{seq % 60:02d}:00,S{seq},{seq + 1}")
+        return {
+            "stops.txt": "\n".join(stops) + "\n",
+            "trips.txt": "\n".join(trips) + "\n",
+            "stop_times.txt": "\n".join(times) + "\n",
+        }
+
+    assert upload(client, zip_bytes(feed_files("v1"))).status_code == 201
+
+    stop = threading.Event()
+    errors = []
+
+    def reader():
+        while not stop.is_set():
+            response = client.get("/api/v1/routes/R1/diff?from=current&to=current")
+            if response.status_code != 200:
+                errors.append(response.text)
+                return
+            body = response.json()
+            if body["from_version"] != body["to_version"]:
+                errors.append(
+                    f"mixed snapshot: from={body['from_version']} to={body['to_version']}"
+                )
+                return
+            if body["removed_trips"] or body["added_trips"]:
+                errors.append("self-compare against one snapshot must pair everything")
+                return
+
+    def publisher():
+        for index in range(2, 8):
+            response = upload(client, zip_bytes(feed_files(f"v{index}")))
+            if response.status_code != 201:
+                errors.append(response.text)
+                return
+
+    reader_thread = threading.Thread(target=reader)
+    reader_thread.start()
+    try:
+        publisher()
+    finally:
+        stop.set()
+        reader_thread.join()
+
+    assert errors == []
+    assert client.get("/api/v1/versions").json()["current_version"] == 7

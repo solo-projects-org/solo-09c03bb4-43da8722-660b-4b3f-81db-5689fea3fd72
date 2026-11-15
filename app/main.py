@@ -31,6 +31,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from . import diff
 from .gtfs_parse import FeedRejected, validate_archive
 from .store import (
     StorageError,
@@ -59,7 +60,9 @@ app = FastAPI(
         "发布时校验：站点/班次 ID 唯一、停站必须引用存在的站点和班次、"
         "每站必须有到站时刻、同班次站序不得重复、时刻随站序不得倒退；"
         "超过 24 点的 GTFS 时刻（如 25:10:00）是合法的。"
-        "校验失败会返回文件与行号，且不会改变任何已发布版本。"
+        "校验失败会返回文件与行号，且不会改变任何已发布版本。\n\n"
+        "另提供跨版线路对照：在两个版本间按停站序列一对一配对同线路班次，"
+        "输出逐站到站时差与班次增减。"
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -107,6 +110,36 @@ class TripStops(BaseModel):
     trip_id: str
     route_id: Optional[str]
     stops: List[StopArrival]
+
+
+class StopTimeDiff(BaseModel):
+    stop_id: str
+    from_stop_sequence: int = Field(description="旧版中的站序")
+    to_stop_sequence: int = Field(description="新版中的站序")
+    from_arrival_time: str = Field(description="旧版到站时刻（GTFS 原始，可超过 24:00:00）")
+    to_arrival_time: str = Field(description="新版到站时刻（GTFS 原始，可超过 24:00:00）")
+    from_arrival_seconds: int = Field(description="旧版到站时刻（自服务日起点的秒数）")
+    to_arrival_seconds: int = Field(description="新版到站时刻（自服务日起点的秒数）")
+    diff_seconds: int = Field(description="到站时差（秒）：新版减旧版，正为晚点")
+
+
+class TripPairDiff(BaseModel):
+    from_trip_id: str = Field(description="旧版班次 ID")
+    to_trip_id: str = Field(description="新版班次 ID（可能已重编）")
+    first_stop_diff_seconds: int = Field(description="首站发车时差（秒）：新版减旧版")
+    stops: List[StopTimeDiff] = Field(description="逐站到站对照（按站序对齐）")
+
+
+class RouteDiff(BaseModel):
+    route_id: str
+    from_version: int = Field(description="实际解析出的旧版号")
+    to_version: int = Field(description="实际解析出的新版号")
+    max_offset_minutes: int = Field(description="首站偏移上限（分钟）")
+    matched_pairs: List[TripPairDiff] = Field(
+        description="配对成功的班次（停站序列相同且首站偏移不超限），按 trip_id 稳定排序"
+    )
+    removed_trips: List[str] = Field(description="旧版中退出（未能配对）的班次 ID")
+    added_trips: List[str] = Field(description="新版中新增（未能配对）的班次 ID")
 
 
 class ValidationFailure(BaseModel):
@@ -406,6 +439,102 @@ def trip_stops_current(
     info, route_id, stops = get_store().trip_stops(version, trip_id)
     return TripStops(
         version_id=info.version_id, trip_id=trip_id, route_id=route_id, stops=stops
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cross-version route comparison
+# ---------------------------------------------------------------------------
+
+
+def _to_schedule(trip: dict) -> diff.TripSchedule:
+    return diff.TripSchedule(
+        trip_id=trip["trip_id"],
+        stops=[diff.TripStop(**stop) for stop in trip["stops"]],
+    )
+
+
+@app.get(
+    "/api/v1/routes/{route_id}/diff",
+    response_model=RouteDiff,
+    summary="跨版本对照某条线路的班次增减与到站变化",
+    description=(
+        "在两个已发布版本（可用 current）之间对照一条线路：仅在完整停站 "
+        "stop_id 序列相同的班次间一对一配对（班次 ID 可已重编），"
+        "首站偏移不超过 max_offset_minutes 分钟；先使配对数最多，"
+        "再使首站时间差总和最小。返回配对班次的逐站到站时差（秒），"
+        "并分别列出旧版退出与新版新增的班次。超过 24 点的时刻按服务日秒比较。"
+        "版号解析与两版数据读取处于同一快照，发布交错不会混入新的 current。"
+    ),
+    responses={
+        400: {"model": ErrorResponse, "description": "版号格式非法"},
+        404: {"model": ErrorResponse, "description": "版本或线路不存在"},
+        422: {"model": ErrorResponse, "description": "参数非法（如偏移分钟为负）"},
+    },
+)
+def route_diff(
+    route_id: str,
+    from_version: str = Query(
+        ...,
+        alias="from",
+        description="旧版号或 current",
+        examples=["1", "current"],
+    ),
+    to_version: str = Query(
+        "current",
+        alias="to",
+        description="新版号或 current（默认 current）",
+        examples=["2", "current"],
+    ),
+    max_offset_minutes: int = Query(
+        0, ge=0, description="最大首站偏移分钟数（非负，默认 0 即首站时刻须相同）"
+    ),
+) -> RouteDiff:
+    store = get_store()
+    from_id, to_id, from_rows, to_rows = store.route_schedules_for_diff(
+        from_version, to_version, route_id
+    )
+    result = diff.compute_route_diff(
+        [_to_schedule(trip) for trip in from_rows],
+        [_to_schedule(trip) for trip in to_rows],
+        max_offset_minutes * 60,
+    )
+    return RouteDiff(
+        route_id=route_id,
+        from_version=from_id,
+        to_version=to_id,
+        max_offset_minutes=max_offset_minutes,
+        matched_pairs=[
+            TripPairDiff(
+                from_trip_id=pair.from_trip.trip_id,
+                to_trip_id=pair.to_trip.trip_id,
+                first_stop_diff_seconds=(
+                    pair.to_trip.first_arrival_seconds
+                    - pair.from_trip.first_arrival_seconds
+                ),
+                stops=[
+                    StopTimeDiff(
+                        stop_id=old_stop.stop_id,
+                        from_stop_sequence=old_stop.stop_sequence,
+                        to_stop_sequence=new_stop.stop_sequence,
+                        from_arrival_time=old_stop.arrival_time,
+                        to_arrival_time=new_stop.arrival_time,
+                        from_arrival_seconds=old_stop.arrival_seconds,
+                        to_arrival_seconds=new_stop.arrival_seconds,
+                        diff_seconds=(
+                            new_stop.arrival_seconds - old_stop.arrival_seconds
+                        ),
+                    )
+                    # Pairing guarantees identical stop_id sequences.
+                    for old_stop, new_stop in zip(
+                        pair.from_trip.stops, pair.to_trip.stops
+                    )
+                ],
+            )
+            for pair in result.pairings
+        ],
+        removed_trips=result.removed_trip_ids,
+        added_trips=result.added_trip_ids,
     )
 
 

@@ -89,6 +89,16 @@ class TripNotFound(StorageError):
         )
 
 
+class RouteNotFound(StorageError):
+    def __init__(self, route_id: str, from_version_id: int, to_version_id: int):
+        super().__init__(
+            "route_not_found",
+            f"route_id {route_id!r} has no trips in version {from_version_id} "
+            f"or version {to_version_id}",
+            404,
+        )
+
+
 class ArtifactMissing(StorageError):
     def __init__(self, version_id: int):
         super().__init__(
@@ -483,6 +493,59 @@ class Store:
             for row in rows
         ]
         return self._version_info(version_row), trip_row["route_id"], stops
+
+    def route_schedules_for_diff(
+        self, from_version: str, to_version: str, route_id: str
+    ) -> Tuple[int, int, List[dict], List[dict]]:
+        """Both resolved version ids plus the route's trips in each version.
+
+        Version resolution and every row read happen inside one SQLite read
+        transaction, so the two versions come from a single committed
+        snapshot: a publication committing mid-request can never make
+        ``current`` resolve to two different versions, and the two versions'
+        rows can never be a mixture of two publication states.
+
+        Only the target route's trips and their stop rows are read.
+        """
+        with self.read_transaction() as conn:
+            from_id = self._resolve_version(conn, from_version)
+            to_id = self._resolve_version(conn, to_version)
+            from_trips = self._route_schedules(conn, from_id, route_id)
+            to_trips = self._route_schedules(conn, to_id, route_id)
+        if not from_trips and not to_trips:
+            raise RouteNotFound(route_id, from_id, to_id)
+        return from_id, to_id, from_trips, to_trips
+
+    @staticmethod
+    def _route_schedules(
+        conn: sqlite3.Connection, version_id: int, route_id: str
+    ) -> List[dict]:
+        """One version's trips for a route, each with its ordered stops."""
+        rows = conn.execute(
+            "SELECT t.trip_id AS trip_id, st.stop_sequence AS stop_sequence, "
+            "       st.stop_id AS stop_id, st.arrival_time AS arrival_time, "
+            "       st.arrival_seconds AS arrival_seconds "
+            "FROM trips AS t "
+            "JOIN stop_times AS st "
+            "  ON st.version_id = t.version_id AND st.trip_id = t.trip_id "
+            "WHERE t.version_id = ? AND t.route_id = ? "
+            "ORDER BY t.trip_id, st.stop_sequence",
+            (version_id, route_id),
+        ).fetchall()
+        trips: Dict[str, dict] = {}
+        for row in rows:
+            trip = trips.setdefault(
+                row["trip_id"], {"trip_id": row["trip_id"], "stops": []}
+            )
+            trip["stops"].append(
+                {
+                    "stop_sequence": row["stop_sequence"],
+                    "stop_id": row["stop_id"],
+                    "arrival_time": row["arrival_time"],
+                    "arrival_seconds": row["arrival_seconds"],
+                }
+            )
+        return list(trips.values())
 
     # ------------------------------------------------------------- artifacts
     def artifact_path(self, info: VersionInfo) -> Path:
